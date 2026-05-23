@@ -670,7 +670,11 @@ def generate_income_idea(d, regime_bias):
         "price":               price,
         "iv":                  iv,
         "iv_rank_proxy":       iv_rank,
+        "iv_pct_label":        d.get("iv_pct_label", f"~{iv_rank:.0f}%"),
         "hv30":                hv30,
+        "rsi":                 d.get("rsi"),
+        "pct_above_ma50":      d.get("pct_above_ma50"),
+        "is_range_bound":      d.get("is_range_bound"),
         "range_pct":           d["range_pct"],
         "mom_1m":              d["mom_1m"],
         "earnings":            d["earnings"],
@@ -798,7 +802,10 @@ def generate_growth_idea(d, regime_bias, sector_strong=True):
         "price":           price,
         "iv":              iv,
         "iv_rank_proxy":   iv_rank,
+        "iv_pct_label":    d.get("iv_pct_label", f"~{iv_rank:.0f}%"),
         "hv30":            d["hv30"],
+        "rsi":             d.get("rsi"),
+        "pct_above_ma50":  d.get("pct_above_ma50"),
         "range_pct":       rng,
         "mom_1m":          mom_1m,
         "earnings":        d["earnings"],
@@ -1211,7 +1218,7 @@ def render_trade_card(idea, regime_bias):
     market    = idea["market"]
     price     = idea["price"]
     iv        = idea["iv"]
-    iv_rank   = idea["iv_rank_proxy"]
+    iv_rank   = idea.get("iv_rank_proxy", 0) or 0
     hv30      = idea["hv30"]
     mom_1m    = idea["mom_1m"]
     rng       = idea["range_pct"]
@@ -1220,6 +1227,8 @@ def render_trade_card(idea, regime_bias):
     opt_vol   = idea["options_vol"]
     strategy  = idea["strategy"]
     score     = idea["score"]
+    iv_rank   = idea.get("iv_rank_proxy", 0) or 0
+    iv_label  = idea.get("iv_pct_label") or f"~{iv_rank:.0f}%"
     mkt_flag  = "🇬🇧" if market == "UK-ADR" else ("📊" if market == "ETF" else "🇺🇸")
 
     if idea["type"] == "income":
