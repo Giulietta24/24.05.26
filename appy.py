@@ -1858,6 +1858,45 @@ with tab_sectors:
 
         st.divider()
 
+        # ── Build all_rows (used by both conflict panel and calls/puts) ──
+        # Fetches 52W range and P/C ratio for every ETF in selected sectors.
+        # P/C ratio is needed for conflict detection (bullish range but bearish options).
+        all_rows = []
+        for sector in sel_sectors:
+            for ticker, name in ETF_SECTORS.get(sector, []):
+                d    = returns_data.get(ticker, {})
+                rng  = None
+                pc_r = None
+                try:
+                    t    = yf.Ticker(ticker)
+                    info = t.info
+                    p    = safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
+                    lo   = safe_float(info.get("fiftyTwoWeekLow"))
+                    hi   = safe_float(info.get("fiftyTwoWeekHigh"))
+                    if p and lo and hi and hi != lo:
+                        rng = round((p - lo) / (hi - lo) * 100, 1)
+                    # P/C ratio — needed for conflict detection
+                    try:
+                        dates = t.options
+                        if dates:
+                            chain = t.option_chain(dates[0])
+                            cv    = chain.calls["volume"].fillna(0).sum()
+                            pv    = chain.puts["volume"].fillna(0).sum()
+                            if cv > 0:
+                                pc_r = round(pv / cv, 2)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                all_rows.append({
+                    "Sector":    sector,
+                    "Ticker":    ticker,
+                    "1M %":      d.get("ret_1m"),
+                    "RS vs SPY": d.get("rs_vs_spy"),
+                    "52W %":     rng,
+                    "P/C":       pc_r,
+                })
+
         # ── Conflict Detection Panel ──────────────────────────
         # Restores the conflict analysis from the previous dashboard.
         # Fires when an ETF is near its 52W high (looks bullish)
@@ -2046,45 +2085,6 @@ with tab_sectors:
             st.info("No conflicts detected — all ETFs with bullish 52W range have neutral or bullish P/C ratios.")
 
         st.divider()
-
-        # ── Build all_rows (used by both conflict panel and calls/puts) ──
-        # Fetches 52W range and P/C ratio for every ETF in selected sectors.
-        # P/C ratio is needed for conflict detection (bullish range but bearish options).
-        all_rows = []
-        for sector in sel_sectors:
-            for ticker, name in ETF_SECTORS.get(sector, []):
-                d    = returns_data.get(ticker, {})
-                rng  = None
-                pc_r = None
-                try:
-                    t    = yf.Ticker(ticker)
-                    info = t.info
-                    p    = safe_float(info.get("regularMarketPrice") or info.get("currentPrice"))
-                    lo   = safe_float(info.get("fiftyTwoWeekLow"))
-                    hi   = safe_float(info.get("fiftyTwoWeekHigh"))
-                    if p and lo and hi and hi != lo:
-                        rng = round((p - lo) / (hi - lo) * 100, 1)
-                    # P/C ratio — needed for conflict detection
-                    try:
-                        dates = t.options
-                        if dates:
-                            chain = t.option_chain(dates[0])
-                            cv    = chain.calls["volume"].fillna(0).sum()
-                            pv    = chain.puts["volume"].fillna(0).sum()
-                            if cv > 0:
-                                pc_r = round(pv / cv, 2)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-                all_rows.append({
-                    "Sector":    sector,
-                    "Ticker":    ticker,
-                    "1M %":      d.get("ret_1m"),
-                    "RS vs SPY": d.get("rs_vs_spy"),
-                    "52W %":     rng,
-                    "P/C":       pc_r,
-                })
 
         # ── Calls / Puts panels ───────────────────────────────
         st.markdown("### Best Sectors for Calls vs Puts")
