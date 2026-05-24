@@ -611,18 +611,56 @@ def generate_income_idea(d, regime_bias):
     if d["options_vol"] and d["options_vol"] < 500:
         return None
 
-    # Calculate suggested put spread strikes
-    # Sell put at ~5-7% below current price (below support)
-    # Buy put 5 points lower (defines your max risk)
-    sell_put  = round(price * 0.93, 0)  # 7% OTM
-    buy_put   = sell_put - 5            # $5 wide spread
+    # ── Dynamic spread width based on stock price ──────────────
+    # A $5 spread on a $50 stock (10% wide) is very different from
+    # a $5 spread on NVDA at $900 (0.5% wide — almost meaningless).
+    # Scale the spread width so it represents a consistent ~3-4% of price.
+    if price < 50:
+        spread_width = 2.50
+        sell_pct     = 0.94    # 6% OTM on cheap stocks
+    elif price < 150:
+        spread_width = 5.0
+        sell_pct     = 0.93    # 7% OTM
+    elif price < 500:
+        spread_width = 10.0
+        sell_pct     = 0.92    # 8% OTM — more room needed on mid-price stocks
+    else:
+        spread_width = 25.0
+        sell_pct     = 0.91    # 9% OTM on high-price stocks like NVDA
 
-    # Estimated premium (rough: ~30% of spread width when IV is elevated)
-    est_premium_per_share = round((sell_put - buy_put) * 0.30 * (iv_rank / 100), 2)
-    est_premium_per_share = max(est_premium_per_share, 0.30)
+    # ── Anchor sell strike to 50MA or recent low if available ───
+    # Selling puts BELOW a known support level is safer than mechanical OTM %.
+    # The stock has to break that support level before you lose money.
+    ma50_level = None
+    recent_low = None
+    try:
+        _hist_s = yf.Ticker(ticker).history(period="3mo", auto_adjust=True)
+        if len(_hist_s) >= 50:
+            ma50_level = float(_hist_s["Close"].rolling(50).mean().iloc[-1])
+        if len(_hist_s) >= 20:
+            recent_low = float(_hist_s["Low"].tail(20).min())
+    except Exception:
+        pass
+
+    # Choose the best anchor for the sell strike:
+    # Prefer the level that is below price but above the mechanical OTM strike
+    mech_sell = round(price * sell_pct, 0)
+    sell_put  = mech_sell
+
+    if ma50_level and ma50_level < price * 0.98 and ma50_level > price * 0.85:
+        # 50MA is a natural support — sell just below it
+        sell_put = round(ma50_level * 0.99, 0)
+    elif recent_low and recent_low < price * 0.97 and recent_low > price * 0.84:
+        sell_put = round(recent_low * 0.985, 0)
+
+    buy_put = sell_put - spread_width
+
+    # Estimated premium scaled to spread width and IV rank
+    est_premium_per_share = round(spread_width * 0.30 * (iv_rank / 100), 2)
+    est_premium_per_share = max(est_premium_per_share, spread_width * 0.15)
     est_premium_contract  = round(est_premium_per_share * 100, 0)
-    max_risk_contract     = (sell_put - buy_put - est_premium_per_share) * 100
-    max_risk_contract     = max(max_risk_contract, 100)
+    max_risk_contract     = (spread_width - est_premium_per_share) * 100
+    max_risk_contract     = max(max_risk_contract, spread_width * 70)
 
     # How many contracts for £700 max risk
     max_risk_gbp = 700
@@ -661,6 +699,19 @@ def generate_income_idea(d, regime_bias):
     elif rsi and (rsi > 75 or rsi < 30):
         score -= 10                              # overbought/oversold = risky
 
+    # ── Dynamic expiry recommendation based on VIX ─────────────
+    # VIX spike → shorter expiry collects same premium with less risk
+    # Low VIX → longer expiry needed to collect meaningful premium
+    if vix_val and vix_val >= 30:
+        rec_expiry = "14-21 DTE"
+        expiry_note = f"VIX {vix_val:.0f} — elevated. Shorter expiry (14-21 DTE) collects same premium with less time exposure."
+    elif vix_val and vix_val <= 15:
+        rec_expiry = "45 DTE"
+        expiry_note = f"VIX {vix_val:.0f} — low. Use longer expiry (45 DTE) to collect meaningful premium."
+    else:
+        rec_expiry = "21-30 DTE"
+        expiry_note = f"VIX {vix_val:.0f} — normal. Standard 21-30 DTE expiry."
+
     return {
         "type":                "income",
         "ticker":              d["ticker"],
@@ -687,6 +738,10 @@ def generate_income_idea(d, regime_bias):
         "contracts":           contracts,
         "score":               round(score, 0),
         "strategy":            f"Sell ${sell_put:.0f}/${buy_put:.0f} Put Spread",
+        "spread_width":        spread_width,
+        "rec_expiry":          rec_expiry,
+        "expiry_note":         expiry_note,
+        "anchor_used":         "50MA" if (ma50_level and sell_put != mech_sell and ma50_level < price) else ("Recent Low" if (recent_low and sell_put != mech_sell) else "Mechanical OTM"),
     }
 
 
@@ -905,9 +960,18 @@ def fetch_fundamentals(ticker):
         # Quality score (0-100)
         # Designed to surface genuinely strong small cap businesses
         q_score = 0
-        if rev_growth_pct and rev_growth_pct >= 20:   q_score += 25
-        elif rev_growth_pct and rev_growth_pct >= 10: q_score += 15
-        elif rev_growth_pct and rev_growth_pct >= 0:  q_score += 5
+        # Revenue growth — but also check for deceleration
+        # A company growing at 20% last year but now at 5% is NOT a 20% grower.
+        # yfinance revenueGrowth is the most recent quarter YoY.
+        # We penalise if growth is decelerating vs what the market expects.
+        if rev_growth_pct and rev_growth_pct >= 20:
+            q_score += 25
+        elif rev_growth_pct and rev_growth_pct >= 10:
+            q_score += 15
+        elif rev_growth_pct and rev_growth_pct >= 0:
+            q_score += 5
+        elif rev_growth_pct and rev_growth_pct < 0:
+            q_score -= 10   # declining revenue = serious red flag for small caps
 
         if fcf and fcf > 0:                           q_score += 25   # cash generative
         elif op_cf and op_cf > 0:                     q_score += 10   # at least positive ops CF
@@ -1196,6 +1260,70 @@ def calc_relative_strength(stock_tickers, etf_ticker, period="1mo"):
         return pd.DataFrame()
 
 
+
+@st.cache_data(ttl=300)   # 5-min cache — VWAP is intraday, needs to be fresh
+def fetch_vwap(tickers):
+    """
+    Fetches today's VWAP for each ticker using 5-minute intraday data.
+
+    VWAP = Volume Weighted Average Price.
+    Resets every trading day at market open.
+    Institutional traders use it as a key reference:
+      • Price above VWAP = buyers in control = call bias
+      • Price below VWAP = sellers in control = put bias
+      • Price crossing VWAP upward = potential entry for calls
+      • Price crossing VWAP downward = potential entry for puts
+
+    For options specifically:
+      ENTRY: buy calls when price is above VWAP and pulling back to it
+             buy puts when price is below VWAP and bouncing up to it
+      EXIT:  take profit on calls when price hits VWAP resistance
+             take profit on puts when price hits VWAP support
+
+    Only meaningful during market hours — outside hours shows yesterday's
+    closing VWAP which is less useful.
+    """
+    result = {}
+    for ticker in tickers:
+        try:
+            df = yf.download(ticker, period="1d", interval="5m",
+                             auto_adjust=True, progress=False)
+            if df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            # VWAP = sum(typical_price × volume) / sum(volume)
+            # Typical price = (High + Low + Close) / 3
+            typical = (df["High"] + df["Low"] + df["Close"]) / 3
+            cum_tpv  = (typical * df["Volume"]).cumsum()
+            cum_vol  = df["Volume"].cumsum()
+            vwap_series = cum_tpv / cum_vol
+            vwap_val = float(vwap_series.iloc[-1])
+            last_price = float(df["Close"].iloc[-1])
+
+            pct_vs_vwap = round((last_price - vwap_val) / vwap_val * 100, 2)
+
+            if pct_vs_vwap >= 1.5:
+                vwap_sig = f"📈 {pct_vs_vwap:+.1f}% above — Call bias"
+            elif pct_vs_vwap >= 0.3:
+                vwap_sig = f"🟡 {pct_vs_vwap:+.1f}% above — Near VWAP"
+            elif pct_vs_vwap <= -1.5:
+                vwap_sig = f"📉 {pct_vs_vwap:+.1f}% below — Put bias"
+            elif pct_vs_vwap <= -0.3:
+                vwap_sig = f"🟡 {pct_vs_vwap:+.1f}% below — Near VWAP"
+            else:
+                vwap_sig = f"⚖️ AT VWAP — Wait for direction"
+
+            result[ticker] = {
+                "vwap":         round(vwap_val, 2),
+                "price":        round(last_price, 2),
+                "pct_vs_vwap":  pct_vs_vwap,
+                "vwap_sig":     vwap_sig,
+            }
+        except Exception:
+            pass
+    return result
+
 # ============================================================
 # UI HELPERS
 # ============================================================
@@ -1312,10 +1440,24 @@ def render_trade_card(idea, regime_bias):
                 st.markdown(f"- Options volume: {opt_vol:,}" if opt_vol else "- Options volume: unknown")
 
             st.divider()
+            # Show dynamic expiry recommendation and anchor info
+            rec_exp  = idea.get("rec_expiry", "21-30 DTE")
+            exp_note = idea.get("expiry_note", "")
+            anchor   = idea.get("anchor_used", "Mechanical OTM")
+            sw       = idea.get("spread_width", 5)
+            st.markdown(f"**⏱ Recommended expiry:** {rec_exp}")
+            if exp_note:
+                st.caption(exp_note)
+            st.caption(
+                f"Strike anchor: **{anchor}** — "
+                f"spread width: **${sw:.2f}** "
+                f"(scaled to stock price for meaningful risk/reward)"
+            )
             st.markdown(
-                "**On IBKR:** Options chain → select expiry ~21-30 days out → "
+                f"**On IBKR:** Options chain → select expiry **{rec_exp}** → "
                 f"Sell {ticker} ${sell_put:.0f} Put / Buy {ticker} ${buy_put:.0f} Put "
-                "(bull put spread). Check the mid-price — collect at least $0.30+ to make it worthwhile."
+                f"(bull put spread, ${sw:.0f} wide). "
+                "Check the mid-price — collect at least 25-30% of spread width to make it worthwhile."
             )
 
     else:  # growth
@@ -1463,7 +1605,7 @@ st.caption(
 # MAIN TABS
 # ============================================================
 
-tab_ideas, tab_macro, tab_sectors, tab_holdings, tab_options, tab_smallcap, tab_invest = st.tabs([
+tab_ideas, tab_macro, tab_sectors, tab_holdings, tab_options, tab_smallcap, tab_invest, tab_journal = st.tabs([
     "🎯 Trade Ideas",
     "🌍 Macro",
     "📈 ETF Sectors",
@@ -1471,6 +1613,7 @@ tab_ideas, tab_macro, tab_sectors, tab_holdings, tab_options, tab_smallcap, tab_
     "⚡ Options Filter",
     "🔬 Small Cap Options",
     "📊 Investment Watchlist",
+    "📒 Trade Journal",
 ])
 
 
@@ -2279,6 +2422,8 @@ with tab_options:
         raw_tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
 
         with st.spinner(f"Fetching options data for {', '.join(raw_tickers)}..."):
+            # Fetch VWAP first (intraday entry/exit signal)
+            vwap_data = fetch_vwap(raw_tickers)
             results = []
             for ticker in raw_tickers:
                 d = fetch_stock_data(ticker)
@@ -2293,13 +2438,44 @@ with tab_options:
                     else:
                         sig = "⚪ N/A"
 
+                    # RSI signal
+                    rsi_v = d.get("rsi")
+                    if rsi_v:
+                        if rsi_v >= 75:   rsi_sig = f"🔴 {rsi_v:.0f} Overbought"
+                        elif rsi_v >= 60: rsi_sig = f"🟡 {rsi_v:.0f} Elevated"
+                        elif rsi_v <= 30: rsi_sig = f"🟢 {rsi_v:.0f} Oversold"
+                        elif rsi_v <= 45: rsi_sig = f"🟡 {rsi_v:.0f} Low"
+                        else:             rsi_sig = f"🟢 {rsi_v:.0f} Neutral"
+                    else:
+                        rsi_sig = "N/A"
+
+                    # Direction signal combining momentum + RSI
+                    mom = d.get("mom_1m", 0) or 0
+                    rng = d.get("range_pct", 50) or 50
+                    if mom >= 5 and rng >= 65 and (not rsi_v or rsi_v < 75):
+                        dir_sig = "📈 Call bias"
+                    elif mom <= -5 and rng <= 40 and (not rsi_v or rsi_v > 25):
+                        dir_sig = "📉 Put bias"
+                    elif rsi_v and rsi_v >= 75:
+                        dir_sig = "⚠️ Overbought — caution on calls"
+                    elif rsi_v and rsi_v <= 30:
+                        dir_sig = "⚠️ Oversold — caution on puts"
+                    else:
+                        dir_sig = "🟡 Neutral"
+
                     results.append({
                         "Ticker":        ticker,
                         "Price":         f"${d['price']:.2f}" if d["price"] else "N/A",
+                        "Direction":     dir_sig,
+                        "RSI":           rsi_sig,
+                        "Mom 1M":        f"{mom:+.1f}%",
+                        "52W Range":     f"{rng:.0f}%",
+                        "VWAP Signal":   vwap_data.get(ticker, {}).get("vwap_sig", "⚪ Fetching..."),
+                        "vs VWAP":       f"{vwap_data.get(ticker, {}).get('pct_vs_vwap', 0):+.2f}%" if ticker in vwap_data else "N/A",
                         "IV %":          d["iv"],
                         "HV30 %":        d["hv30"],
                         "IV/HV":         round(d["iv"]/d["hv30"],2) if d["iv"] and d["hv30"] else None,
-                        "Signal":        sig,
+                        "IV Signal":     sig,
                         "IV Rank ~":     f"~{d['iv_rank_proxy']:.0f}%" if d["iv_rank_proxy"] else "N/A",
                         "Options Vol":   d["options_vol"],
                         "Next Earnings": d["earnings"] or "⚠️ Check manually",
@@ -2322,6 +2498,70 @@ with tab_options:
 
             st.dataframe(df.style.apply(_style_opts, axis=1),
                          use_container_width=True, hide_index=True)
+
+            # VWAP section
+            st.markdown("#### 📍 VWAP Entry & Exit Signals")
+            st.caption(
+                "VWAP resets daily. Most useful for 1-5 day options plays. "
+                "Use it to time your entry — don't just buy the signal, wait for price to confirm with VWAP."
+            )
+            with st.expander("How to use VWAP for entries and exits on IBKR", expanded=False):
+                st.markdown("""
+**For CALLS:**
+- **Ideal entry:** Price pulls back to VWAP from above, then bounces up → buy the call at the bounce
+- **Avoid:** Buying calls when price is already far above VWAP — you're chasing
+- **Take profit:** When price stalls at a resistance level or VWAP is rising fast and price extends too far above
+- **Stop:** Exit the call if price closes below VWAP on a 30-minute candle
+
+**For PUTS:**
+- **Ideal entry:** Price bounces up to VWAP from below, then rolls over → buy the put at the roll
+- **Avoid:** Buying puts when price is already far below VWAP — risk of a VWAP snap-back bounce
+- **Take profit:** When price reaches the next support level or bounces off the day's low
+- **Stop:** Exit the put if price closes back above VWAP
+
+**AT VWAP signal:**
+- Price is at equilibrium — wait for the next directional move before entering
+- This is not a signal to trade — it's a signal to watch
+
+**On IBKR:**
+- Open the chart for the stock → add VWAP indicator (Indicators → VWAP)
+- Switch to 5-minute or 15-minute candles for intraday view
+- Watch for price to test VWAP and react — that reaction is your entry signal
+                """)
+
+            if vwap_data:
+                vwap_rows = []
+                for ticker in raw_tickers:
+                    if ticker in vwap_data:
+                        v = vwap_data[ticker]
+                        vwap_rows.append({
+                            "Ticker":      ticker,
+                            "Price":       f"${v['price']:.2f}",
+                            "VWAP":        f"${v['vwap']:.2f}",
+                            "vs VWAP":     f"{v['pct_vs_vwap']:+.2f}%",
+                            "Signal":      v["vwap_sig"],
+                            "Entry?":      (
+                                "✅ Wait for pullback to VWAP, buy call on bounce"
+                                if v["pct_vs_vwap"] >= 1
+                                else "✅ Wait for bounce to VWAP, buy put on roll"
+                                if v["pct_vs_vwap"] <= -1
+                                else "⏳ AT VWAP — wait for direction"
+                            )
+                        })
+                if vwap_rows:
+                    def _style_vwap(row):
+                        styles = [""] * len(row)
+                        if "Signal" in row.index:
+                            i = list(row.index).index("Signal")
+                            s = str(row["Signal"])
+                            if "Call" in s:  styles[i] = "background-color:#bbf7d0"
+                            elif "Put" in s: styles[i] = "background-color:#fecaca"
+                            else:            styles[i] = "background-color:#fef08a"
+                        return styles
+                    st.dataframe(
+                        pd.DataFrame(vwap_rows).style.apply(_style_vwap, axis=1),
+                        use_container_width=True, hide_index=True
+                    )
 
             # Earnings warnings
             st.markdown("#### ⚠️ Earnings Risk")
@@ -2774,3 +3014,224 @@ the regime to turn before committing capital.
             """)
 
 
+
+
+# ============================================================
+# TAB 8 — TRADE JOURNAL
+# ============================================================
+
+with tab_journal:
+    st.subheader("📒 Trade Journal")
+    st.caption(
+        "Log every trade you take from this dashboard. "
+        "Tracks whether the signals actually worked over time. "
+        "Stored in your browser session — export to CSV to save permanently."
+    )
+
+    # Initialise journal in session state
+    if "journal" not in st.session_state:
+        st.session_state["journal"] = []
+
+    # ── Log a new trade ───────────────────────────────────────
+    st.markdown("### ➕ Log a Trade")
+    with st.form("journal_form", clear_on_submit=True):
+        jc1, jc2, jc3 = st.columns(3)
+        with jc1:
+            j_ticker    = st.text_input("Ticker", placeholder="NVDA").upper()
+            j_type      = st.selectbox("Trade Type", [
+                "Income — Put Credit Spread",
+                "Growth — Buy Call",
+                "Growth — Buy Put",
+                "Income — Call Credit Spread",
+                "Other",
+            ])
+        with jc2:
+            j_entry     = st.number_input("Premium paid / collected ($)", min_value=0.0, step=0.05)
+            j_contracts = st.number_input("Contracts", min_value=1, step=1)
+            j_expiry    = st.date_input("Expiry date")
+        with jc3:
+            j_regime    = st.selectbox("Regime at entry", [
+                regime_label,
+                "🟢 Risk-On",
+                "🟡 Mildly Risk-On",
+                "🟡 Neutral",
+                "🟠 Cautious",
+                "🔴 Risk-Off",
+                "⚠️ Stagflation Risk",
+            ])
+            j_iv_rank   = st.number_input("IV Rank at entry (~%)", min_value=0, max_value=100, step=1)
+            j_thesis    = st.text_area("Thesis / why this trade", height=80,
+                                       placeholder="e.g. SMH breaking out, NVDA leading semis, IV rank 75%")
+
+        j_submitted = st.form_submit_button("📝 Log Trade", type="primary")
+        if j_submitted and j_ticker:
+            entry_cost_gbp = round(j_entry * j_contracts * 100 / GBPUSD, 0)
+            st.session_state["journal"].append({
+                "Date":          pd.Timestamp.now().strftime("%Y-%m-%d"),
+                "Ticker":        j_ticker,
+                "Type":          j_type,
+                "Premium $":     j_entry,
+                "Contracts":     int(j_contracts),
+                "Total Cost £":  entry_cost_gbp,
+                "Expiry":        str(j_expiry),
+                "Regime":        j_regime,
+                "IV Rank ~":     j_iv_rank,
+                "Thesis":        j_thesis,
+                "Exit Price $":  None,
+                "P&L £":         None,
+                "Result":        "Open",
+            })
+            st.success(f"✅ {j_ticker} {j_type} logged.")
+
+    # ── Update existing trades ────────────────────────────────
+    journal = st.session_state["journal"]
+
+    if journal:
+        st.divider()
+        st.markdown("### 📋 Open & Closed Trades")
+
+        open_trades = [(i, t) for i, t in enumerate(journal) if t["Result"] == "Open"]
+        if open_trades:
+            st.markdown("**Update open trades:**")
+            for idx, trade in open_trades:
+                with st.expander(
+                    f"📌 {trade['Date']} — {trade['Ticker']} {trade['Type']} | "
+                    f"Entry: ${trade['Premium $']:.2f} × {trade['Contracts']} contracts | "
+                    f"Expiry: {trade['Expiry']}",
+                    expanded=False
+                ):
+                    st.markdown(f"**Regime at entry:** {trade['Regime']}")
+                    st.markdown(f"**Thesis:** {trade['Thesis']}")
+                    uc1, uc2 = st.columns(2)
+                    with uc1:
+                        exit_price = st.number_input(
+                            "Exit price $ (0 = expired worthless)",
+                            min_value=0.0, step=0.05,
+                            key=f"exit_{idx}"
+                        )
+                    with uc2:
+                        result = st.selectbox(
+                            "Result",
+                            ["Open", "Win", "Loss", "Break-even", "Expired worthless"],
+                            key=f"result_{idx}"
+                        )
+                    if st.button("💾 Update", key=f"update_{idx}"):
+                        # P&L calculation
+                        entry = trade["Premium $"]
+                        contracts = trade["Contracts"]
+                        if "Income" in trade["Type"]:
+                            # Sold premium: profit = entry - exit
+                            pnl_per_share = entry - exit_price
+                        else:
+                            # Bought options: profit = exit - entry
+                            pnl_per_share = exit_price - entry
+                        pnl_usd = round(pnl_per_share * contracts * 100, 2)
+                        pnl_gbp = round(pnl_usd / GBPUSD, 0)
+
+                        st.session_state["journal"][idx]["Exit Price $"] = exit_price
+                        st.session_state["journal"][idx]["P&L £"]        = pnl_gbp
+                        st.session_state["journal"][idx]["Result"]        = result
+                        st.rerun()
+
+        # ── Full journal table ────────────────────────────────
+        st.divider()
+        st.markdown("### 📊 Full Journal")
+        jdf = pd.DataFrame(journal)
+
+        def _style_journal(row):
+            styles = [""] * len(row)
+            if "Result" in row.index:
+                i = list(row.index).index("Result")
+                r = str(row["Result"])
+                if r in ("Win","Expired worthless"):   styles[i] = "background-color:#bbf7d0"
+                elif r == "Loss":                       styles[i] = "background-color:#fecaca"
+                elif r == "Break-even":                 styles[i] = "background-color:#fef08a"
+                else:                                   styles[i] = "background-color:#e0f2fe"
+            if "P&L £" in row.index:
+                i = list(row.index).index("P&L £")
+                try:
+                    v = float(row["P&L £"])
+                    styles[i] = "background-color:#bbf7d0" if v >= 0 else "background-color:#fecaca"
+                except Exception:
+                    pass
+            return styles
+
+        st.dataframe(
+            jdf.style.apply(_style_journal, axis=1),
+            use_container_width=True, hide_index=True
+        )
+
+        # ── Stats ─────────────────────────────────────────────
+        closed = [t for t in journal if t["Result"] != "Open"]
+        if closed:
+            st.divider()
+            st.markdown("### 📈 Performance Summary")
+            wins   = len([t for t in closed if t["Result"] in ("Win","Expired worthless")])
+            losses = len([t for t in closed if t["Result"] == "Loss"])
+            total  = len(closed)
+            win_rate = round(wins / total * 100, 0) if total else 0
+            total_pnl = sum(t["P&L £"] or 0 for t in closed)
+
+            ps1, ps2, ps3, ps4 = st.columns(4)
+            ps1.metric("Win Rate",     f"{win_rate:.0f}%",
+                       delta=f"{wins}W / {losses}L")
+            ps2.metric("Total P&L",   f"£{total_pnl:,.0f}",
+                       delta="profit" if total_pnl >= 0 else "loss")
+            ps3.metric("Trades taken", total)
+            ps4.metric("Avg per trade",
+                       f"£{total_pnl/total:,.0f}" if total else "N/A")
+
+            # Win rate by strategy
+            by_type = {}
+            for t in closed:
+                tp = t["Type"]
+                by_type.setdefault(tp, {"wins": 0, "total": 0, "pnl": 0})
+                by_type[tp]["total"] += 1
+                if t["Result"] in ("Win", "Expired worthless"):
+                    by_type[tp]["wins"] += 1
+                by_type[tp]["pnl"] += t["P&L £"] or 0
+
+            st.markdown("**By strategy:**")
+            for tp, stats in by_type.items():
+                wr = round(stats["wins"] / stats["total"] * 100, 0)
+                pl = stats["pnl"]
+                colour = "🟢" if pl >= 0 else "🔴"
+                st.markdown(
+                    f"{colour} **{tp}**: "
+                    f"{stats['total']} trades, {wr:.0f}% win rate, "
+                    f"P&L: £{pl:,.0f}"
+                )
+
+        # ── Export ────────────────────────────────────────────
+        st.divider()
+        csv = jdf.to_csv(index=False)
+        st.download_button(
+            "📥 Export Journal to CSV",
+            data=csv,
+            file_name=f"trade_journal_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
+        st.caption(
+            "⚠️ The journal is stored in your browser session — "
+            "it will be lost when you close the tab. "
+            "Export to CSV regularly to keep a permanent record. "
+            "In a future version this can be connected to Google Sheets for persistence."
+        )
+
+        if st.button("🗑️ Clear All Trades", key="clear_journal"):
+            st.session_state["journal"] = []
+            st.rerun()
+
+    else:
+        st.info(
+            "No trades logged yet. "
+            "Use the form above to log your first trade. "
+            "Tracking your trades is the only way to know if the signals are working for you."
+        )
+        st.markdown("""
+**Why track every trade:**
+- You'll quickly see which signal combinations actually work for your style
+- Win rate by strategy tells you whether income or growth plays suit you better
+- Regime at entry lets you see if you're trading with or against the macro trend
+- It creates accountability — you can't fool yourself about performance
+        """)
